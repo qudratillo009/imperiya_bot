@@ -2,8 +2,8 @@
 IMPERIYA — "Imperiyaning eng sodiq xodimi" konkurs boti
 -------------------------------------------------------
 Ishga tushirish:
-    Windows PowerShell:  $env:BOT_TOKEN="YANGI_TOKENNI_SHU_YERGA_YOZING"; python imperiya_bot.py
-    Linux / macOS:       export BOT_TOKEN="YANGI_TOKENNI_SHU_YERGA_YOZING" && python imperiya_bot.py
+    Windows PowerShell:  $env:BOT_TOKEN="YOUR_NEW_BOT_TOKEN"; python bot.py
+    Linux / macOS:       export BOT_TOKEN="YOUR_NEW_BOT_TOKEN" && python bot.py
 
 Admin buyruqlari:
     /admin            — admin panel
@@ -16,10 +16,11 @@ Admin buyruqlari:
 import html
 import logging
 import os
-import sqlite3
-from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from datetime import datetime, timedelta
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -49,9 +50,6 @@ DEFAULT_CONTEST_DAYS = int(os.getenv("CONTEST_DAYS", "10"))
 
 # Har necha referral = 1 bonus ovoz
 REFERRALS_PER_BONUS = 5
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "imperiya_konkurs.db")
 
 PRIZES = [
     ("🥇", "1-o‘rin", "Smart TV"),
@@ -97,19 +95,25 @@ log = logging.getLogger("imperiya-bot")
 # DATABASE
 # =========================================================
 
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
-cursor = db.cursor()
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable topilmadi. Render/Neon sozlamasini tekshiring.")
 
-cursor.executescript(
+# PostgreSQL — ma'lumotlar Render serverining vaqtinchalik diskida emas,
+# tashqi persistent database'da saqlanadi. Telegram user ID'lari katta
+# bo‘lishi mumkinligi sabab BIGINT ishlatiladi.
+db = psycopg2.connect(DATABASE_URL, connect_timeout=15)
+cursor = db.cursor(cursor_factory=RealDictCursor)
+
+cursor.execute(
     """
     CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         first_name TEXT,
         username TEXT,
         subscribed INTEGER DEFAULT 0,
         instagram_verified INTEGER DEFAULT 0,
-        referrer_id INTEGER,
+        referrer_id BIGINT,
         referral_count INTEGER DEFAULT 0,
         points INTEGER DEFAULT 0,
         bonus_votes INTEGER DEFAULT 0,
@@ -118,14 +122,14 @@ cursor.executescript(
         created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS votes (
-        vote_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
+        vote_id BIGSERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL,
         candidate TEXT NOT NULL,
         vote_type TEXT NOT NULL,
         created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS referral_done (
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         created_at TEXT
     );
     CREATE TABLE IF NOT EXISTS settings (
@@ -135,12 +139,15 @@ cursor.executescript(
     """
 )
 
-# Eski bazadan yangilash (bonus_granted ustuni yo‘q bo‘lsa qo‘shamiz)
-cols = [r["name"] for r in cursor.execute("PRAGMA table_info(users)")]
+# Eski/yangi schema uchun kerakli ustunni tekshiramiz.
+cursor.execute(
+    "SELECT column_name AS name FROM information_schema.columns "
+    "WHERE table_schema = 'public' AND table_name = 'users'"
+)
+cols = [r["name"] for r in cursor.fetchall()]
 if "bonus_granted" not in cols:
     cursor.execute("ALTER TABLE users ADD COLUMN bonus_granted INTEGER DEFAULT 0")
-    # Eski foydalanuvchilar uchun: hozirgi bonusni "berilgan" deb hisoblaymiz
-    cursor.execute("UPDATE users SET bonus_granted = points / ?", (REFERRALS_PER_BONUS,))
+    cursor.execute("UPDATE users SET bonus_granted = points / %s", (REFERRALS_PER_BONUS,))
 db.commit()
 
 # =========================================================
@@ -149,14 +156,14 @@ db.commit()
 
 
 def get_setting(key: str, default=None):
-    row = cursor.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    row = cursor.execute("SELECT value FROM settings WHERE key = %s", (key,)).fetchone()
     return row["value"] if row else default
 
 
 def set_setting(key: str, value: str):
     cursor.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        "INSERT INTO settings (key, value) VALUES (%s, %s) "
+        "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
         (key, value),
     )
     db.commit()
@@ -213,7 +220,7 @@ def save_user(user):
     cursor.execute(
         """
         INSERT INTO users (user_id, first_name, username, created_at)
-        VALUES (?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s)
         ON CONFLICT(user_id) DO UPDATE SET
             first_name = excluded.first_name,
             username = excluded.username
@@ -224,7 +231,7 @@ def save_user(user):
 
 
 def get_user(user_id: int):
-    return cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,)).fetchone()
 
 
 def user_has_requirements(user_id: int) -> bool:
@@ -374,18 +381,18 @@ async def process_referral(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         return
     if row["subscribed"] != 1 or row["instagram_verified"] != 1:
         return
-    if cursor.execute("SELECT 1 FROM referral_done WHERE user_id = ?", (user_id,)).fetchone():
+    if cursor.execute("SELECT 1 FROM referral_done WHERE user_id = %s", (user_id,)).fetchone():
         return
     if not get_user(referrer_id):
         return
 
     cursor.execute(
-        "INSERT INTO referral_done (user_id, created_at) VALUES (?, ?)",
+        "INSERT INTO referral_done (user_id, created_at) VALUES (%s, %s)",
         (user_id, datetime.now().isoformat()),
     )
     cursor.execute(
         "UPDATE users SET referral_count = referral_count + 1, points = points + 1 "
-        "WHERE user_id = ?",
+        "WHERE user_id = %s",
         (referrer_id,),
     )
 
@@ -394,8 +401,8 @@ async def process_referral(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     new_bonus = should_have - ref["bonus_granted"]
     if new_bonus > 0:
         cursor.execute(
-            "UPDATE users SET bonus_votes = bonus_votes + ?, bonus_granted = ? "
-            "WHERE user_id = ?",
+            "UPDATE users SET bonus_votes = bonus_votes + %s, bonus_granted = %s "
+            "WHERE user_id = %s",
             (new_bonus, should_have, referrer_id),
         )
     db.commit()
@@ -430,7 +437,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = get_user(user.id)
             if referrer_id != user.id and row["referrer_id"] is None and get_user(referrer_id):
                 cursor.execute(
-                    "UPDATE users SET referrer_id = ? WHERE user_id = ?",
+                    "UPDATE users SET referrer_id = %s WHERE user_id = %s",
                     (referrer_id, user.id),
                 )
                 db.commit()
@@ -484,7 +491,7 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Eslatma: Instagram obunasini oddiy bot API orqali tekshirib bo‘lmaydi.
     # Hozircha foydalanuvchi tugmani bosib tasdiqlaydi.
     cursor.execute(
-        "UPDATE users SET subscribed = ?, instagram_verified = 1 WHERE user_id = ?",
+        "UPDATE users SET subscribed = %s, instagram_verified = 1 WHERE user_id = %s",
         (1 if telegram_ok else 0, user_id),
     )
     db.commit()
@@ -603,18 +610,18 @@ async def vote_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if row["main_vote_used"] == 0:
         vote_type = "main"
-        cursor.execute("UPDATE users SET main_vote_used = 1 WHERE user_id = ?", (user_id,))
+        cursor.execute("UPDATE users SET main_vote_used = 1 WHERE user_id = %s", (user_id,))
     elif row["bonus_votes"] > 0:
         vote_type = "bonus"
         cursor.execute(
-            "UPDATE users SET bonus_votes = bonus_votes - 1 WHERE user_id = ?", (user_id,)
+            "UPDATE users SET bonus_votes = bonus_votes - 1 WHERE user_id = %s", (user_id,)
         )
     else:
         await query.answer("❌ Sizda ovoz qolmagan.", show_alert=True)
         return
 
     cursor.execute(
-        "INSERT INTO votes (user_id, candidate, vote_type, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO votes (user_id, candidate, vote_type, created_at) VALUES (%s, %s, %s, %s)",
         (user_id, candidate, vote_type, datetime.now().isoformat()),
     )
     db.commit()
@@ -696,10 +703,10 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = get_user(user_id)
 
     total_votes = cursor.execute(
-        "SELECT COUNT(*) AS n FROM votes WHERE user_id = ?", (user_id,)
+        "SELECT COUNT(*) AS n FROM votes WHERE user_id = %s", (user_id,)
     ).fetchone()["n"]
     last = cursor.execute(
-        "SELECT candidate FROM votes WHERE user_id = ? ORDER BY vote_id DESC LIMIT 1",
+        "SELECT candidate FROM votes WHERE user_id = %s ORDER BY vote_id DESC LIMIT 1",
         (user_id,),
     ).fetchone()
 
@@ -764,7 +771,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     def one(sql):
-        return cursor.execute(sql).fetchone()[0]
+        row = cursor.execute(sql).fetchone()
+        return next(iter(row.values())) if row else 0
 
     await edit(
         query,
@@ -915,6 +923,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("BOT ERROR: %r", context.error)
+    try:
+        db.rollback()
+    except Exception:
+        pass
 
 
 async def post_init(application: Application):
@@ -929,7 +941,7 @@ async def post_init(application: Application):
 
 
 # =========================================================
-# RENDER HEALTH SERVER
+# RENDER FREE WEB SERVICE HEALTH SERVER
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -952,7 +964,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    log.info("Render health server %s-portda ishga tushdi", port)
+    log.info("Render health server %s-portda ishga tushdi.", port)
     server.serve_forever()
 
 
@@ -962,9 +974,8 @@ def start_health_server():
 
 
 def main():
-    # Render Web Service uchun kerak bo‘ladigan HTTP portni ochamiz.
     threading.Thread(target=start_health_server, daemon=True).start()
-
+    log.info("PostgreSQL database ulandi va ma'lumotlar persistent saqlanadi.")
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     for name, handler in [
